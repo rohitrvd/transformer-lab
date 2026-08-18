@@ -71,13 +71,28 @@ class SinusoidalPositionalEncoding(nn.Module):
 
         self.register_buffer("pe", pe)
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(self, x: Tensor, position_offset: int = 0) -> Tensor:
         """Add positional encodings to a batch of token embeddings.
 
         x: (batch, seq_len, d_model) -> (batch, seq_len, d_model)
+        position_offset: index of `x`'s first position in the full sequence.
+            0 for a normal forward pass (or prefill). During cached
+            autoregressive decoding, `x` holds only the newest token(s), so
+            the caller passes `position_offset=kv_cache.seq_len` (the number
+            of positions already cached) to fetch the correct slice of `pe`
+            instead of always starting from position 0.
         """
         seq_len = x.size(1)
-        x = x + self.pe[:, :seq_len, :]  # (batch, seq_len, d_model) + (1, seq_len, d_model)
+        max_seq_len = self.pe.size(1)
+        if position_offset + seq_len > max_seq_len:
+            raise ValueError(
+                f"position {position_offset + seq_len} exceeds max_seq_len={max_seq_len}; "
+                "generation (or input) has run past the length TransformerConfig.max_seq_len "
+                "was built for. Without this check, slicing past the end of `pe` would silently "
+                "return an empty tensor instead of a clear error."
+            )
+        x = x + self.pe[:, position_offset : position_offset + seq_len, :]
+        # (batch, seq_len, d_model) + (1, seq_len, d_model)
         return self.dropout(x)
 
 
@@ -93,10 +108,12 @@ class TransformerEmbedding(nn.Module):
         self.token_embedding = TokenEmbedding(config)
         self.positional_encoding = SinusoidalPositionalEncoding(config)
 
-    def forward(self, token_ids: Tensor) -> Tensor:
+    def forward(self, token_ids: Tensor, position_offset: int = 0) -> Tensor:
         """Embed token ids and add positional information.
 
         token_ids: (batch, seq_len) -> (batch, seq_len, d_model)
+        position_offset: see `SinusoidalPositionalEncoding.forward`; 0 for a
+            normal/prefill pass, `kv_cache.seq_len` during cached decoding.
         """
         x = self.token_embedding(token_ids)  # (batch, seq_len) -> (batch, seq_len, d_model)
-        return self.positional_encoding(x)  # (batch, seq_len, d_model)
+        return self.positional_encoding(x, position_offset=position_offset)  # (batch, seq_len, d_model)

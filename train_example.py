@@ -17,6 +17,7 @@ Usage:
 from __future__ import annotations
 
 import random
+from typing import Optional
 
 import torch
 from torch import Tensor, nn
@@ -86,14 +87,13 @@ def greedy_decode_accuracy(
     return exact_match
 
 
-def main() -> None:
-    """Train an encoder-decoder transformer on sequence reversal and report accuracy."""
-    random.seed(0)
-    torch.manual_seed(0)
+def make_default_config() -> TransformerConfig:
+    """The TransformerConfig used for the sequence-reversal toy task.
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    config = TransformerConfig(
+    Shared by `train_model()` here and by `inference/quantization.py` /
+    `benchmark.py`, so every script exercises the same architecture.
+    """
+    return TransformerConfig(
         vocab_size=VOCAB_SIZE,
         max_seq_len=32,
         pad_token_id=PAD_ID,
@@ -105,30 +105,59 @@ def main() -> None:
         dropout=0.0,  # this is a fast regression check, not a realistic training run
         attention_type="multi_head",
     )
+
+
+def train_model(
+    config: TransformerConfig,
+    num_steps: int = 2000,
+    seq_len: int = 8,
+    batch_size: int = 64,
+    lr: float = 2e-3,
+    device: Optional[torch.device] = None,
+    log_every: Optional[int] = 200,
+) -> EncoderDecoderTransformer:
+    """Train an encoder-decoder transformer on sequence reversal and return it.
+
+    Pulled out of `main()` so other scripts (`inference/quantization.py`,
+    `benchmark.py`) can obtain a real trained model on this repo's toy task
+    without duplicating the training loop. Pass `log_every=None` to train
+    silently.
+    """
+    device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = build_encoder_decoder(config).to(device)
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=2e-3)
-    criterion = nn.CrossEntropyLoss(ignore_index=PAD_ID)
-
-    seq_len = 8
-    batch_size = 64
-    num_steps = 2000
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    criterion = nn.CrossEntropyLoss(ignore_index=config.pad_token_id)
 
     for step in range(1, num_steps + 1):
         src, decoder_input, target = make_batch(batch_size, seq_len, device)
 
         logits = model(src, decoder_input)  # (batch, seq_len + 1, vocab_size)
         loss = criterion(
-            logits.reshape(-1, VOCAB_SIZE), target.reshape(-1)
+            logits.reshape(-1, config.vocab_size), target.reshape(-1)
         )  # flatten (batch, tgt_len, vocab) -> (batch * tgt_len, vocab) for cross-entropy
 
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
 
-        if step % 200 == 0 or step == 1:
+        if log_every and (step % log_every == 0 or step == 1):
             acc = greedy_decode_accuracy(model, seq_len, num_samples=128, device=device)
             print(f"step {step:4d} | loss {loss.item():.4f} | greedy exact-match acc {acc:.3f}")
+
+    return model
+
+
+def main() -> None:
+    """Train an encoder-decoder transformer on sequence reversal and report accuracy."""
+    random.seed(0)
+    torch.manual_seed(0)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    config = make_default_config()
+    seq_len = 8
+
+    model = train_model(config, num_steps=2000, seq_len=seq_len, batch_size=64, lr=2e-3, device=device)
 
     final_acc = greedy_decode_accuracy(model, seq_len, num_samples=256, device=device)
     print(f"\nFinal greedy exact-match accuracy over 256 samples: {final_acc:.3f}")

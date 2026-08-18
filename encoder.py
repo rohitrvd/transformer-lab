@@ -46,7 +46,9 @@ class EncoderLayer(nn.Module):
 
         def self_attention(x: Tensor) -> Tensor:
             out, attn_weights = self.self_attn(x, x, x, mask=mask)
-            self.last_attn_weights = attn_weights  # (batch, num_heads, seq_len, seq_len), kept for inspection/tests
+            self.last_attn_weights = attn_weights.detach()  # (batch, num_heads, seq_len, seq_len); detached so it
+            # doesn't keep this step's autograd graph alive (and so the module stays deepcopy-able, e.g. for
+            # inference/quantization.py's torch.ao.quantization.quantize_dynamic)
             return out
 
         x = self.self_attn_sublayer(x, self_attention)  # (batch, seq_len, d_model)

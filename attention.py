@@ -17,18 +17,29 @@ they receive an `attention_cls: Type[BaseAttention]` resolved from the
 config's string key and instantiate it themselves. This is what makes
 attention swaps a config change instead of an edit to the surrounding
 model.
+
+`MultiHeadAttention.forward` additionally accepts optional `kv_cache` /
+`layer_idx` keyword arguments (see `inference/kv_cache.py`), used only
+during autoregressive decoding. They default to `None`, so every existing
+call site (training, the no-cache forward pass) is unaffected. Custom
+`BaseAttention` subclasses are not required to support them — only variants
+that opt in by handling these kwargs work with the cached generation path
+in `inference/generation.py`.
 """
 
 from __future__ import annotations
 
 import math
 from abc import ABC, abstractmethod
-from typing import Optional, Tuple
+from typing import Optional, Tuple, TYPE_CHECKING
 
 import torch
 from torch import Tensor, nn
 
 from config import TransformerConfig, register_attention
+
+if TYPE_CHECKING:
+    from inference.kv_cache import KVCache
 
 
 class BaseAttention(nn.Module, ABC):
@@ -51,6 +62,8 @@ class BaseAttention(nn.Module, ABC):
         key: Tensor,
         value: Tensor,
         mask: Optional[Tensor] = None,
+        kv_cache: Optional["KVCache"] = None,
+        layer_idx: Optional[int] = None,
     ) -> Tuple[Tensor, Tensor]:
         """Compute attention.
 
@@ -59,6 +72,12 @@ class BaseAttention(nn.Module, ABC):
         value: (batch, kv_len, d_model)
         mask:  broadcastable to (batch, num_heads, q_len, kv_len); positions
                with mask == 0 are excluded from attention.
+        kv_cache: optional KVCache (see inference/kv_cache.py); when given,
+               `key`/`value` are the newly computed tokens only, and prior
+               K/V are read from (and the new K/V appended to) the cache at
+               `layer_idx` instead of being recomputed from scratch.
+        layer_idx: which layer's slot to use in `kv_cache`; required
+               together with `kv_cache`, ignored otherwise.
         Returns:
             output: (batch, q_len, d_model)
             attn_weights: (batch, num_heads, q_len, kv_len)
@@ -150,21 +169,29 @@ class MultiHeadAttention(BaseAttention):
         key: Tensor,
         value: Tensor,
         mask: Optional[Tensor] = None,
+        kv_cache: Optional["KVCache"] = None,
+        layer_idx: Optional[int] = None,
     ) -> Tuple[Tensor, Tensor]:
         """Project to Q/K/V, split into heads, attend, merge, project out.
 
         query: (batch, q_len, d_model)
-        key:   (batch, kv_len, d_model)
-        value: (batch, kv_len, d_model)
+        key:   (batch, kv_len, d_model) — or, when `kv_cache` is given, just
+               the newly-seen tokens (kv_len = new_len, e.g. 1 during decode)
+        value: (batch, kv_len, d_model) — same shape convention as `key`
         mask:  broadcastable to (batch, num_heads, q_len, kv_len)
+        kv_cache: optional cache; see `BaseAttention.forward` for semantics
+        layer_idx: this layer's slot in `kv_cache`, required if it's given
         """
         q = self.w_q(query)  # (batch, q_len, d_model) -> (batch, q_len, d_model)
-        k = self.w_k(key)  # (batch, kv_len, d_model) -> (batch, kv_len, d_model)
-        v = self.w_v(value)  # (batch, kv_len, d_model) -> (batch, kv_len, d_model)
-
         q = self._split_heads(q)  # (batch, q_len, d_model) -> (batch, num_heads, q_len, d_k)
-        k = self._split_heads(k)  # (batch, kv_len, d_model) -> (batch, num_heads, kv_len, d_k)
-        v = self._split_heads(v)  # (batch, kv_len, d_model) -> (batch, num_heads, kv_len, d_k)
+
+        if kv_cache is not None:
+            new_k = self._split_heads(self.w_k(key))  # (batch, new_len, d_model) -> (batch, num_heads, new_len, d_k)
+            new_v = self._split_heads(self.w_v(value))  # (batch, new_len, d_model) -> (batch, num_heads, new_len, d_k)
+            k, v = kv_cache.update(layer_idx, new_k, new_v)  # (batch, num_heads, total_len, d_k) each
+        else:
+            k = self._split_heads(self.w_k(key))  # (batch, kv_len, d_model) -> (batch, num_heads, kv_len, d_k)
+            v = self._split_heads(self.w_v(value))  # (batch, kv_len, d_model) -> (batch, num_heads, kv_len, d_k)
 
         if mask is not None and mask.dim() == 3:
             mask = mask.unsqueeze(1)  # (batch, q_len, kv_len) -> (batch, 1, q_len, kv_len), broadcasts over heads

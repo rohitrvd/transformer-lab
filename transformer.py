@@ -5,11 +5,21 @@ objects. The `build_*` factory functions resolve `config.attention_type`
 and `config.cross_attention_type` from the attention registry and wire the
 resulting classes into `Encoder`/`Decoder`, so choosing a different
 attention implementation is done entirely through the config passed here.
+
+`DecoderOnlyModel.forward` and `EncoderDecoderTransformer.decode` accept an
+optional `kv_cache` (see `inference/kv_cache.py`, used by
+`inference/generation.py`). When given, the caller is expected to pass only
+the newest token(s) as input rather than the full sequence so far — the
+model uses `kv_cache.seq_len` to (a) skip rebuilding a causal mask (a single
+new-token query can always attend to everything already cached, since
+nothing "future" exists yet) and (b) offset positional encoding so the new
+token(s) get their true position rather than restarting from 0. Passing no
+cache (the default) reproduces the exact training-time forward pass.
 """
 
 from __future__ import annotations
 
-from typing import Optional, Type
+from typing import Optional, Type, TYPE_CHECKING
 
 import torch
 from torch import Tensor, nn
@@ -22,6 +32,9 @@ from encoder import Encoder
 from feedforward import PositionwiseFeedForward
 from layer_norm import LayerNorm, SublayerConnection
 from masks import combine_masks, make_causal_mask, make_padding_mask
+
+if TYPE_CHECKING:
+    from inference.kv_cache import KVCache
 
 
 class EncoderOnlyModel(nn.Module):
@@ -69,24 +82,37 @@ class DecoderOnlyModel(nn.Module):
         self.layers = nn.ModuleList(
             [_DecoderOnlyLayer(config, attention_cls) for _ in range(config.num_decoder_layers)]
         )
+        for idx, layer in enumerate(self.layers):
+            layer.layer_idx = idx  # this layer's slot in a KVCache, see inference/kv_cache.py
         self.norm = LayerNorm(config.d_model, eps=config.layer_norm_eps)
         self.output_projection = nn.Linear(config.d_model, config.vocab_size)
         if config.tie_embeddings:
             self.output_projection.weight = self.embedding.token_embedding.embedding.weight
 
-    def forward(self, input_ids: Tensor) -> Tensor:
+    def forward(self, input_ids: Tensor, kv_cache: Optional["KVCache"] = None) -> Tensor:
         """Embed, run causally-masked self-attention layers, project to logits.
 
-        input_ids: (batch, seq_len) -> (batch, seq_len, vocab_size)
+        input_ids: (batch, seq_len) -> (batch, seq_len, vocab_size). With a
+            `kv_cache`, `seq_len` is normally the full prompt on the first
+            call (prefill) and 1 on every subsequent call (decode) — the
+            caller is responsible for only passing the new token(s).
+        kv_cache: optional cache; see module docstring.
         """
-        seq_len = input_ids.size(1)
-        padding_mask = make_padding_mask(input_ids, self.config.pad_token_id)  # (batch, 1, 1, seq_len)
-        causal_mask = make_causal_mask(seq_len, input_ids.device)  # (1, 1, seq_len, seq_len)
-        mask = combine_masks(padding_mask, causal_mask)  # (batch, 1, seq_len, seq_len)
+        position_offset = kv_cache.seq_len if kv_cache is not None else 0
+        x = self.embedding(input_ids, position_offset=position_offset)  # (batch, seq_len) -> (batch, seq_len, d_model)
 
-        x = self.embedding(input_ids)  # (batch, seq_len) -> (batch, seq_len, d_model)
+        if kv_cache is None or kv_cache.seq_len == 0:
+            # No cache, or this is the prefill call: build the usual full causal + padding mask.
+            seq_len = input_ids.size(1)
+            padding_mask = make_padding_mask(input_ids, self.config.pad_token_id)  # (batch, 1, 1, seq_len)
+            causal_mask = make_causal_mask(seq_len, input_ids.device)  # (1, 1, seq_len, seq_len)
+            mask = combine_masks(padding_mask, causal_mask)  # (batch, 1, seq_len, seq_len)
+        else:
+            # Decode step: the new token(s) may attend to everything cached; nothing to mask.
+            mask = None
+
         for layer in self.layers:
-            x = layer(x, mask=mask)  # (batch, seq_len, d_model)
+            x = layer(x, mask=mask, kv_cache=kv_cache)  # (batch, seq_len, d_model)
         x = self.norm(x)  # (batch, seq_len, d_model)
         return self.output_projection(x)  # (batch, seq_len, d_model) -> (batch, seq_len, vocab_size)
 
@@ -105,15 +131,20 @@ class _DecoderOnlyLayer(nn.Module):
         self.feed_forward = PositionwiseFeedForward(config)
         self.self_attn_sublayer = SublayerConnection(config)
         self.feed_forward_sublayer = SublayerConnection(config)
+        self.layer_idx: Optional[int] = None  # assigned by DecoderOnlyModel.__init__
 
-    def forward(self, x: Tensor, mask: Optional[Tensor] = None) -> Tensor:
+    def forward(self, x: Tensor, mask: Optional[Tensor] = None, kv_cache: Optional["KVCache"] = None) -> Tensor:
         """Causal self-attention followed by feed-forward, each with residual+norm.
 
         x: (batch, seq_len, d_model) -> (batch, seq_len, d_model)
+        kv_cache: optional cache; see module docstring.
         """
 
         def self_attention(x: Tensor) -> Tensor:
-            out, _ = self.self_attn(x, x, x, mask=mask)
+            if kv_cache is not None:
+                out, _ = self.self_attn(x, x, x, mask=mask, kv_cache=kv_cache, layer_idx=self.layer_idx)
+            else:
+                out, _ = self.self_attn(x, x, x, mask=mask)
             return out
 
         x = self.self_attn_sublayer(x, self_attention)  # (batch, seq_len, d_model)
@@ -154,24 +185,41 @@ class EncoderDecoderTransformer(nn.Module):
         x = self.src_embedding(src_ids)  # (batch, src_len) -> (batch, src_len, d_model)
         return self.encoder(x, mask=src_mask)  # (batch, src_len, d_model)
 
-    def decode(self, tgt_ids: Tensor, memory: Tensor, src_ids: Tensor) -> Tensor:
+    def decode(
+        self,
+        tgt_ids: Tensor,
+        memory: Tensor,
+        src_ids: Tensor,
+        kv_cache: Optional["KVCache"] = None,
+    ) -> Tensor:
         """Embed the target prefix and decode against encoder memory.
 
-        tgt_ids: (batch, tgt_len) -> (batch, tgt_len, d_model)
+        tgt_ids: (batch, tgt_len) -> (batch, tgt_len, d_model). With a
+            `kv_cache`, `tgt_len` is normally the full decoder prompt on the
+            first call (prefill) and 1 on every subsequent call (decode).
         memory: (batch, src_len, d_model), the encoder output.
         src_ids: (batch, src_len), used to rebuild the source padding mask
-            for cross-attention.
+            for cross-attention (recomputed every call — cross-attention is
+            not cached, since `memory` is already fixed after `encode()`).
+        kv_cache: optional cache for decoder self-attention; see module docstring.
         """
-        tgt_len = tgt_ids.size(1)
-        tgt_padding_mask = make_padding_mask(tgt_ids, self.config.pad_token_id)  # (batch, 1, 1, tgt_len)
-        causal_mask = make_causal_mask(tgt_len, tgt_ids.device)  # (1, 1, tgt_len, tgt_len)
-        self_attn_mask = combine_masks(tgt_padding_mask, causal_mask)  # (batch, 1, tgt_len, tgt_len)
+        position_offset = kv_cache.seq_len if kv_cache is not None else 0
+        x = self.tgt_embedding(tgt_ids, position_offset=position_offset)  # (batch, tgt_len) -> (batch, tgt_len, d_model)
+
+        if kv_cache is None or kv_cache.seq_len == 0:
+            # No cache, or this is the prefill call: build the usual full causal + padding mask.
+            tgt_len = tgt_ids.size(1)
+            tgt_padding_mask = make_padding_mask(tgt_ids, self.config.pad_token_id)  # (batch, 1, 1, tgt_len)
+            causal_mask = make_causal_mask(tgt_len, tgt_ids.device)  # (1, 1, tgt_len, tgt_len)
+            self_attn_mask = combine_masks(tgt_padding_mask, causal_mask)  # (batch, 1, tgt_len, tgt_len)
+        else:
+            # Decode step: the new token(s) may attend to everything cached; nothing to mask.
+            self_attn_mask = None
 
         cross_attn_mask = make_padding_mask(src_ids, self.config.pad_token_id)  # (batch, 1, 1, src_len)
 
-        x = self.tgt_embedding(tgt_ids)  # (batch, tgt_len) -> (batch, tgt_len, d_model)
         return self.decoder(
-            x, memory, self_attn_mask=self_attn_mask, cross_attn_mask=cross_attn_mask
+            x, memory, self_attn_mask=self_attn_mask, cross_attn_mask=cross_attn_mask, kv_cache=kv_cache
         )  # (batch, tgt_len, d_model)
 
     def forward(self, src_ids: Tensor, tgt_ids: Tensor) -> Tensor:
